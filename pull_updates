@@ -1,0 +1,172 @@
+#!/usr/bin/python
+
+from __future__ import print_function
+
+import dbsession
+import schema
+import config
+import client
+import sys
+import wiflight
+import datetime
+
+def refresh_resources(session, conf, c):
+    session.query(schema.Resource).delete()
+    resource_types = dict(
+        (x['TabName'], x['TabType'])
+        for x in c.DataFull("RESOURCETYPE")
+    )
+    for x in c.DataFull("RESOURCE"):
+        rtype = x['Category']
+        if rtype in resource_types and resource_types[rtype] == 'Aircraft':
+            rtype = 'aircraft'
+        else:
+            rtype = 'other'
+        session.add(schema.Resource(
+            CompCode=conf.CompCode, ResourceID=x['ResourceID'],
+            resource_type=rtype
+        ))
+    for x in c.DataFull("INSTRUCTOR"):
+        session.add(schema.Resource(
+            CompCode=conf.CompCode, ResourceID=x['InstructorID'],
+            resource_type='instructor'
+        ))
+
+def is_aircraft(session, conf, c, candidate):
+    if not candidate:
+        return False
+    ac = session.query(schema.Resource).get((conf.CompCode, candidate))
+    if not ac:
+        # This resource is not known at all. Better refresh the table
+        refresh_resources(session, conf, c)
+        ac = session.query(schema.Resource).get((conf.CompCode, candidate))
+        if not ac:
+            # Still no? Ignore it I guess
+            return False
+    return ac.resource_type == 'aircraft'
+
+def blank_reservation(conf, key):
+    return wiflight.APIReservation('genav-connector-%s@%s' % (key, conf.domain))
+
+def make_wiflight_reservation(session, conf, c, booking):
+    """Make a Wi-Flight reservation out of a GenAV booking."""
+
+    # First, see if we can find an aircraft
+    aircraft = None
+    if is_aircraft(session, conf, c, booking['ResourceID1']):
+        aircraft = booking['ResourceID1']
+    if is_aircraft(session, conf, c, booking['ResourceID2']):
+        if aircraft:
+            # Two aircraft on the same booking? We don't
+            # know how to deal with that.
+            return None
+        aircraft = booking['ResourceID2']
+    if not aircraft:
+        # Bookings that are for other things than aircraft
+        # are ignored
+        return None
+
+    resv = blank_reservation(conf, booking['BookingKey'])
+    resv.domain = 'genav-connector'
+    d = datetime.datetime.strptime(booking['StartDate'], "%Y/%m/%d")
+    t = datetime.datetime.strptime(booking['StartTime'], "%H:%M")
+    d = d.replace(hour=t.hour, minute=t.minute)
+    resv.start = d
+    resv.end = d + datetime.timedelta(minutes=int(booking['DurationTime']))
+    resv.aircraft = wiflight.APIAircraft(aircraft)
+    return resv
+
+def pull_updates_from_CompCode(session, CompCode):
+    conf = config.ConnectorConfig(CompCode)
+
+    pull_timestamp = session.query(schema.LastUpdate).get(CompCode)
+
+    dDate, sTime, sSecs = client.format_datetime(
+        pull_timestamp.datetime, pull_timestamp.milliseconds
+    )
+
+    new_pull_timestamp, new_pull_milliseconds = \
+        pull_timestamp.datetime, pull_timestamp.milliseconds
+
+    todelete = set()
+    toupdate = set()
+
+    c = client.GenAVClient(conf.url, CompCode)
+
+    for update in c.ActivityUpdates(
+        pull_timestamp.datetime, pull_timestamp.milliseconds
+    ):
+        # If this entry's timestamp is greater than the timestamp we
+        # used to pull updates (which it should be!) then update the
+        # pull timestamp for next time. The result is that the
+        # pull timestamp should equal the maximum of any of the
+        # individual entry timestamps, or else unchanged in the case
+        # that there are no updates.
+        this_timestamp, this_milliseconds = client.parse_datetime(update)
+        if this_timestamp > new_pull_timestamp or (
+            this_timestamp == new_pull_timestamp and
+            this_milliseconds > new_pull_milliseconds
+        ):
+            new_pull_timestamp = this_timestamp
+            new_pull_milliseconds = this_milliseconds
+
+        if update['Added'] or update['Updated']:
+            if update['TargetTable'] == 'BOOKING':
+                # We only watch for bookings
+                toupdate.add(update['EntryKey'])
+        if update['Deleted']:
+            todelete.add(update['EntryKey'])
+
+    # Anything that was updated but ALSO deleted is in fact just deleted
+    toupdate = toupdate.difference(todelete)
+
+    if toupdate:
+        toupdate = set()
+        for booking in c.DataUpdates(
+            "BOOKING",
+            pull_timestamp.datetime, pull_timestamp.milliseconds
+        ):
+            r = make_wiflight_reservation(session, conf, c, booking)
+            if r:
+                toupdate.add(r)
+
+    pull_timestamp.datetime, pull_timestamp.milliseconds = \
+        new_pull_timestamp, new_pull_milliseconds
+
+    if todelete or toupdate:
+        anonymous_session = wiflight.APISession()
+        with anonymous_session.login(conf.user, conf.password) as wf_session:
+            for x in toupdate:
+                try:
+                    x.save_noguard(wf_session)
+                except wiflight.HTTPError, e:
+                    if e.code == 403 and e.message == 'Cannot reserve this aircraft':
+                        # I guess we skip this reservation for an aircraft that
+                        # either does not exist in Wi-Flight or to which we have
+                        # no access
+                        pass
+                    else:
+                        raise
+            for x in todelete:
+                resv = blank_reservation(conf, x)
+                try:
+                    resv.delete_noguard(wf_session)
+                except wiflight.HTTPError, e:
+                    if e.code == 404:
+                        pass
+                    else:
+                        raise
+
+    session.commit()
+
+def pull_updates_main():
+    CompCode_list = sys.argv[1:]
+    if not CompCode_list:
+        print("Usage:" + sys.argv[0] + "CompCode ...", file=sys.stderr)
+        sys.exit(3)
+    session = dbsession.make_sessionmaker()()
+    for x in CompCode_list:
+        pull_updates_from_CompCode(session, x)
+
+if __name__ == '__main__':
+    pull_updates_main()

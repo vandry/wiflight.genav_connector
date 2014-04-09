@@ -1,0 +1,12 @@
+#!/usr/bin/python
+
+import schema
+import dbsession
+
+def main():
+    session = dbsession.make_sessionmaker()()
+    engine = session.get_bind()
+    schema.Base.metadata.create_all(engine)
+
+if __name__ == '__main__':
+    main()
