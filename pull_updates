@@ -9,6 +9,29 @@ import client
 import sys
 import wiflight
 import datetime
+import optparse
+from copy import copy
+
+def check_timestamp(option, opt, value):
+    try:
+        dotpos = value.find('.')
+        if value[-1] == 'Z' and dotpos >= 0:
+            usec = int(round(float(value[dotpos:-1]) * 1000000.0))
+            value = value[:dotpos] + 'Z'
+        else:
+            usec = 0
+        return datetime.datetime.strptime(
+            value, "%Y-%m-%dT%H:%M:%SZ"
+        ).replace(microsecond=usec)
+    except ValueError:
+        raise optparse.OptionValueError(
+            "option %s: timestamps should be in iso8601 format (got %r)" % (opt, value)
+        )
+
+class MyOption(optparse.Option):
+    TYPES = optparse.Option.TYPES + ("timestamp",)
+    TYPE_CHECKER = copy(optparse.Option.TYPE_CHECKER)
+    TYPE_CHECKER["timestamp"] = check_timestamp
 
 def refresh_resources(session, conf, c):
     session.query(schema.Resource).delete()
@@ -76,14 +99,44 @@ def make_wiflight_reservation(session, conf, c, booking):
     resv.aircraft = wiflight.APIAircraft(aircraft)
     return resv
 
-def pull_updates_from_CompCode(session, CompCode):
+def pull_updates_from_CompCode(session, CompCode, lastupdate):
     conf = config.ConnectorConfig(CompCode)
 
     pull_timestamp = session.query(schema.LastUpdate).get(CompCode)
 
-    dDate, sTime, sSecs = client.format_datetime(
-        pull_timestamp.datetime, pull_timestamp.milliseconds
-    )
+    if lastupdate:
+        if pull_timestamp:
+            print(
+                "WARNING: Overriding last update time from database for CompCode %r" % (CompCode,),
+                file=sys.stderr
+            )
+        else:
+            pull_timestamp = schema.LastUpdate(CompCode=CompCode)
+            session.add(pull_timestamp)
+        pull_timestamp.milliseconds = int(round(lastupdate.microsecond / 1000.0))
+        pull_timestamp.datetime = lastupdate.replace(microsecond=0)
+    else:
+        if not pull_timestamp:
+            print("""
+The pull script has never been run for CompCode %r
+(or the database has been cleared since it was last run).
+The first time the connector is run for a particular CompCode,
+you must use the --reset-last-update option to specify how
+long ago to pull updates from. For example:
+
+   %s --reset-last-update %s %s
+
+Thereafter, the new last update timestamp will be stored in the
+database and the script should be run without the
+--reset-last-update option.
+""" % (
+                    CompCode, sys.argv[0],
+                    datetime.datetime.strftime(datetime.datetime.utcnow(), "%Y-%m-%dT%H:%M:%S"),
+                    CompCode,
+                ), file=sys.stderr
+            )
+            session.rollback()
+            return
 
     new_pull_timestamp, new_pull_milliseconds = \
         pull_timestamp.datetime, pull_timestamp.milliseconds
@@ -160,13 +213,21 @@ def pull_updates_from_CompCode(session, CompCode):
     session.commit()
 
 def pull_updates_main():
-    CompCode_list = sys.argv[1:]
+    parser = optparse.OptionParser(
+        usage="usage: %prog [options] CompCode ...", option_class=MyOption
+    )
+    parser.add_option(
+        "-r", "--reset-last-update", dest="lastupdate",
+        help="Use given timestamp as last update timestamp instead of value from database",
+        default=None, type="timestamp"
+    )
+    options, CompCode_list = parser.parse_args()
     if not CompCode_list:
-        print("Usage:" + sys.argv[0] + "CompCode ...", file=sys.stderr)
+        parser.print_usage()
         sys.exit(3)
     session = dbsession.make_sessionmaker()()
     for x in CompCode_list:
-        pull_updates_from_CompCode(session, x)
+        pull_updates_from_CompCode(session, x, options.lastupdate)
 
 if __name__ == '__main__':
     pull_updates_main()
